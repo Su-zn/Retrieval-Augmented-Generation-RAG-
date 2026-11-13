@@ -82,9 +82,7 @@ class TestChatTurn:
         self, api: ApiContext, install_llm: LLMInstaller, fake_redis: Any
     ) -> None:
         install_llm(scripted_handler([text_response("Employees receive 25 days. [1]")]))
-        api.qdrant.query_results = [
-            make_point(filename="handbook.txt", chunk_index=2, score=0.91)
-        ]
+        api.qdrant.query_results = [make_point(filename="handbook.txt", chunk_index=2, score=0.91)]
 
         response = await api.client.post(
             "/api/v1/chat",
@@ -126,9 +124,7 @@ class TestChatTurn:
     async def test_booking_persistence_failure_returns_503(
         self, api: ApiContext, install_llm: LLMInstaller
     ) -> None:
-        install_llm(
-            scripted_handler([tool_call_response("book_interview", "{}")])
-        )
+        install_llm(scripted_handler([tool_call_response("book_interview", "{}")]))
 
         class FailingBookingService:
             async def book(self, **_: Any) -> Any:
@@ -165,8 +161,6 @@ class TestChatTurn:
 
         assert response.status_code == 200, response.text
         assert response.json()["booking"] is None
-        # Empty retrieval and no booking attempt keep the deterministic refusal,
-        # even though the model produced a follow-up after the unknown tool call.
         assert response.json()["answer"] == NO_CONTEXT_ANSWER
         tool_messages = [
             message

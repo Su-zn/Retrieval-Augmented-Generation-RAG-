@@ -40,21 +40,11 @@ async def chat_endpoint(
     """Answer one conversational turn, optionally booking an interview."""
     try:
         result = await service.answer(session_id=payload.session_id, question=payload.message)
-    except MemoryStoreError as exc:
+    except (MemoryStoreError, RetrievalError, BookingPersistenceError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
-    except RetrievalError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
-    except BookingPersistenceError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
-    except EmbeddingError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    except LLMError as exc:
+    except (EmbeddingError, LLMError) as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     return ChatResponse(

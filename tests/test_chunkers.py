@@ -40,9 +40,7 @@ class TestFixedSizeChunker:
             (10, 10, "chunk_overlap"),
         ],
     )
-    def test_invalid_configuration_is_rejected(
-        self, size: int, overlap: int, message: str
-    ) -> None:
+    def test_invalid_configuration_is_rejected(self, size: int, overlap: int, message: str) -> None:
         with pytest.raises(ValueError, match=message):
             FixedSizeChunker(chunk_size=size, chunk_overlap=overlap)
 

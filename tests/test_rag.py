@@ -56,9 +56,7 @@ def build_service(
 
 
 class TestRetrieval:
-    async def test_grounded_answer_returns_attributed_sources(
-        self, fake_redis: Any
-    ) -> None:
+    async def test_grounded_answer_returns_attributed_sources(self, fake_redis: Any) -> None:
         point = make_point(
             text="Employees receive 25 days of paid annual leave.",
             filename="handbook.txt",
@@ -183,9 +181,7 @@ class TestReformulation:
         )
         assert len(await memory.get_history("sess-multi")) == 4
 
-    async def test_reformulation_failure_falls_back_to_the_question(
-        self, fake_redis: Any
-    ) -> None:
+    async def test_reformulation_failure_falls_back_to_the_question(self, fake_redis: Any) -> None:
         memory = MemoryService(fake_redis)
         await memory.append_exchange("sess-fallback", "Earlier question", "Earlier answer")
 
@@ -211,9 +207,7 @@ class TestReformulation:
         assert result.standalone_query == "Follow-up question?"
         assert result.answer == "Answer. [1]"
 
-    async def test_blank_reformulation_falls_back_to_the_question(
-        self, fake_redis: Any
-    ) -> None:
+    async def test_blank_reformulation_falls_back_to_the_question(self, fake_redis: Any) -> None:
         memory = MemoryService(fake_redis)
         await memory.append_exchange("sess-blank", "Earlier question", "Earlier answer")
 
@@ -238,9 +232,7 @@ class TestCompletionFailures:
 
         qdrant = FakeQdrant()
         qdrant.query_results = [make_point()]
-        service, _, _ = build_service(
-            handler=handler, fake_redis=fake_redis, qdrant=qdrant
-        )
+        service, _, _ = build_service(handler=handler, fake_redis=fake_redis, qdrant=qdrant)
 
         with pytest.raises(LLMError, match="LLM provider request failed"):
             await service.answer(session_id="sess-llm", question="Question?")
@@ -257,9 +249,7 @@ class TestCompletionFailures:
         with pytest.raises(LLMError, match="empty response"):
             await service.answer(session_id="sess-empty-llm", question="Question?")
 
-    async def test_empty_embedding_result_raises_retrieval_error(
-        self, fake_redis: Any
-    ) -> None:
+    async def test_empty_embedding_result_raises_retrieval_error(self, fake_redis: Any) -> None:
         class EmptyEmbedder(FakeEmbedder):
             async def embed_texts(self, texts: list[str]) -> list[list[float]]:
                 return []
@@ -275,9 +265,7 @@ class TestCompletionFailures:
 
 
 class TestChatErrorMapping:
-    async def test_embedding_failure_returns_502(
-        self, api: ApiContext
-    ) -> None:
+    async def test_embedding_failure_returns_502(self, api: ApiContext) -> None:
         api.embedder.error = EmbeddingError("provider down")
 
         response = await api.client.post(

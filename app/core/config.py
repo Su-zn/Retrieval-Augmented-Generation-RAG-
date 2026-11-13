@@ -23,7 +23,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Application
     app_name: str = "Conversational RAG & Interview Booking API"
     app_version: str = "0.1.0"
     environment: Environment = "local"
@@ -31,22 +30,18 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
 
-    # Relational database
     database_url: str = "sqlite+aiosqlite:///./app.db"
     database_echo: bool = False
 
-    # Redis chat memory
     redis_url: str = "redis://localhost:6379/0"
     chat_history_ttl_seconds: int = Field(default=86_400, gt=0)
     chat_history_max_messages: int = Field(default=20, gt=0)
 
-    # Qdrant vector store
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
     qdrant_collection: str = "documents"
     embedding_dimension: int = Field(default=1536, gt=0)
 
-    # LLM & embeddings provider
     llm_api_key: str = ""
     llm_base_url: str | None = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
@@ -54,10 +49,8 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_batch_size: int = Field(default=64, gt=0)
 
-    # Retrieval
     rag_top_k: int = Field(default=5, gt=0, le=50)
 
-    # Uploads
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
 
     @field_validator("qdrant_api_key", "llm_base_url", mode="before")

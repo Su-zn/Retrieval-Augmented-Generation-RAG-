@@ -53,7 +53,6 @@ NO_CONTEXT_ANSWER = (
     "the question."
 )
 
-# Only recent turns are needed to resolve pronouns and ellipsis.
 _REFORMULATION_WINDOW = 6
 
 
@@ -139,9 +138,7 @@ class RagService:
             BookingPersistenceError: a validated booking could not be stored.
         """
         history = await self._memory.get_history(session_id)
-        standalone_query = (
-            await self._reformulate(question, history) if history else question
-        )
+        standalone_query = await self._reformulate(question, history) if history else question
 
         vectors = await self._embedder.embed_texts([standalone_query])
         if not vectors:
@@ -158,13 +155,7 @@ class RagService:
                 history=history,
                 sources=sources,
             )
-            if (
-                not sources
-                and completion.booking is None
-                and not completion.booking_attempted
-            ):
-                # No documents matched and the model did not try to book: keep the
-                # deterministic refusal even though the completion was tool-enabled.
+            if not sources and not completion.booking_attempted:
                 answer = NO_CONTEXT_ANSWER
                 booking = None
             else:
@@ -317,9 +308,7 @@ class RagService:
                     )
                 except BookingValidationError as exc:
                     last_error = str(exc)
-                    logger.info(
-                        "Rejected booking for session %s: %s", session_id, last_error
-                    )
+                    logger.info("Rejected booking for session %s: %s", session_id, last_error)
                     tool_content = f"Booking rejected. {last_error}"
 
             messages.append(
@@ -330,7 +319,6 @@ class RagService:
                 }
             )
 
-        # Second pass: let the model turn the tool result into a natural reply.
         try:
             follow_up = await client.chat.completions.create(
                 model=self._model,
@@ -352,9 +340,7 @@ class RagService:
             elif attempted:
                 content = _booking_clarification(last_error)
             else:
-                raise LLMError(
-                    "The language model returned an empty response after the tool call."
-                )
+                raise LLMError("The language model returned an empty response after the tool call.")
         return _Completion(answer=content, booking=booking, booking_attempted=attempted)
 
 
@@ -407,7 +393,6 @@ def _clean_query(raw: str) -> str:
         if lowered.startswith(prefix):
             value = value[len(prefix) :].strip().strip('"').strip("'").strip()
             break
-    # Keep only the first line in case the model adds commentary.
     value = value.splitlines()[0].strip() if value else ""
     return value[:2_000]
 
@@ -445,9 +430,7 @@ def _to_source_chunk(point: models.ScoredPoint) -> SourceChunk | None:
 
     raw_chunk_index = payload.get("chunk_index")
     chunk_index = (
-        raw_chunk_index
-        if isinstance(raw_chunk_index, int) and raw_chunk_index >= 0
-        else 0
+        raw_chunk_index if isinstance(raw_chunk_index, int) and raw_chunk_index >= 0 else 0
     )
 
     return SourceChunk(

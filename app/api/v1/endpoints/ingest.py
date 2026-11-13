@@ -59,8 +59,7 @@ async def ingest_document_endpoint(
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=(
-                f"File exceeds the maximum upload size of "
-                f"{settings.max_upload_bytes} bytes."
+                f"File exceeds the maximum upload size of " f"{settings.max_upload_bytes} bytes."
             ),
         )
 

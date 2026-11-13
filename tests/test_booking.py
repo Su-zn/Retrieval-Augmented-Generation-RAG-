@@ -163,8 +163,7 @@ class TestBookingToolLoop:
         )
         api.qdrant.query_results = []
         message = (
-            "Book an interview for Jane Doe, jane.doe@example.com, "
-            f"on {FUTURE_DATE} at 15:30."
+            "Book an interview for Jane Doe, jane.doe@example.com, " f"on {FUTURE_DATE} at 15:30."
         )
 
         response = await api.client.post(
