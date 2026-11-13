@@ -7,10 +7,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.core.redis_client import get_redis_dependency
 from app.core.vector_store import get_qdrant
 from app.models.schemas import ChatRequest, ChatResponse
+from app.services.booking_service import BookingPersistenceError, BookingService
 from app.services.embedder import EmbeddingError, EmbeddingService, get_embedding_service
 from app.services.memory_service import MemoryService, MemoryStoreError
 from app.services.rag_service import LLMError, RagService, RetrievalError
@@ -31,20 +34,22 @@ router = APIRouter()
     responses={
         422: {"description": "Empty session_id or message."},
         502: {"description": "Embedding or LLM provider failure."},
-        503: {"description": "Redis or Qdrant unavailable."},
+        503: {"description": "Redis, Qdrant, or relational database unavailable."},
     },
 )
 async def chat_endpoint(
     payload: ChatRequest,
     redis: Annotated[Redis, Depends(get_redis_dependency)],
     qdrant: Annotated[AsyncQdrantClient, Depends(get_qdrant)],
+    session: Annotated[AsyncSession, Depends(get_db)],
     embedder: Annotated[EmbeddingService, Depends(get_embedding_service)],
 ) -> ChatResponse:
-    """Answer one conversational turn and return the sources used."""
+    """Answer one conversational turn, optionally booking an interview."""
     service = RagService(
         memory=MemoryService(redis),
         embedder=embedder,
         qdrant=qdrant,
+        booking_service=BookingService(session),
     )
 
     try:
@@ -57,6 +62,10 @@ async def chat_endpoint(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
+    except BookingPersistenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
     except EmbeddingError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
     except LLMError as exc:
@@ -66,4 +75,5 @@ async def chat_endpoint(
         session_id=payload.session_id,
         answer=result.answer,
         sources=result.sources,
+        booking=result.booking,
     )

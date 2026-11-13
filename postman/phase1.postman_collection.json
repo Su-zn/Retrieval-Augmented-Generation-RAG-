@@ -1,7 +1,7 @@
 {
   "info": {
-    "name": "Conversational RAG Backend - Phases 1-4",
-    "description": "Phase 1: liveness + OpenAPI. Phase 3: POST /api/v1/ingest (multipart PDF/TXT ingestion). Phase 4: POST /api/v1/chat (Redis memory + Qdrant retrieval + grounded answers). Ingest sample.txt first, then run the two chat requests in order to exercise multi-turn memory. The ingest requests reference sample.txt in this folder; if Postman cannot resolve it, pick the file manually in the request body.",
+    "name": "Conversational RAG Backend - Phases 1-5",
+    "description": "Phase 1: liveness + OpenAPI. Phase 3: POST /api/v1/ingest (multipart PDF/TXT ingestion). Phase 4: POST /api/v1/chat (Redis memory + Qdrant retrieval + grounded answers). Phase 5: book_interview tool calling with validated booking persistence. Ingest sample.txt first, then run the chat requests in order to exercise multi-turn memory and booking. The ingest requests reference sample.txt in this folder; if Postman cannot resolve it, pick the file manually in the request body.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -16,6 +16,10 @@
     {
       "key": "sessionId",
       "value": "postman-demo-session"
+    },
+    {
+      "key": "bookingSessionId",
+      "value": "postman-booking-session"
     }
   ],
   "item": [
@@ -330,6 +334,94 @@
             "exec": [
               "pm.test('status is 422', () => pm.response.to.have.status(422));",
               "pm.test('message field is flagged', () => pm.expect(pm.response.json().detail[0].loc).to.include('message'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Book interview (tool call)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{bookingSessionId}}\",\n  \"message\": \"Book an interview for Jane Doe, jane.doe@example.com, on 2030-06-15 at 15:30.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "chat"]
+        },
+        "description": "The LLM emits a book_interview tool call; the API validates every field, inserts an InterviewBooking row, and runs a second completion for the confirmation. Uses a far-future date so the request stays valid."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('booking object is returned', () => pm.expect(body.booking).to.be.an('object'));",
+              "pm.test('candidate name persisted', () => pm.expect(body.booking.candidate_name).to.eql('Jane Doe'));",
+              "pm.test('candidate email persisted', () => pm.expect(body.booking.candidate_email).to.eql('jane.doe@example.com'));",
+              "pm.test('interview date persisted', () => pm.expect(body.booking.interview_date).to.eql('2030-06-15'));",
+              "pm.test('booking belongs to the session', () => pm.expect(body.booking.session_id).to.eql(pm.collectionVariables.get('bookingSessionId')));",
+              "pm.test('answer confirms the booking', () => pm.expect(body.answer).to.be.a('string').and.not.empty);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Book interview without details (no booking)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{bookingSessionId}}-incomplete\",\n  \"message\": \"I'd like to schedule an interview.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "chat"]
+        },
+        "description": "Negative case: small models often invent placeholder details. The email-grounding check rejects any address the user did not supply, so no booking is created and the assistant asks for the missing details."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('no booking is created', () => pm.expect(body.booking).to.eql(null));",
+              "pm.test('assistant asks for details', () => pm.expect(body.answer).to.be.a('string').and.not.empty);"
             ]
           }
         }

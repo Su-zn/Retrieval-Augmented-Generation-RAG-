@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
 from openai import AsyncOpenAI, OpenAIError
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import (
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionMessage,
+    ChatCompletionMessageParam,
+)
 from qdrant_client import AsyncQdrantClient, models
 
 from app.core.config import settings
-from app.models.schemas import SourceChunk
+from app.models.schemas import InterviewBookingRead, SourceChunk
+from app.services.booking_service import (
+    BOOK_INTERVIEW_TOOL,
+    BOOK_INTERVIEW_TOOL_NAME,
+    BookingService,
+    BookingValidationError,
+)
 from app.services.embedder import EmbeddingService
 from app.services.memory_service import ChatMessage, MemoryService
 
@@ -20,10 +31,14 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant answering questions about the user's indexed "
-    "documents. Answer using ONLY the provided context. If the context does not "
-    "contain the answer, say so plainly instead of guessing. Cite the sources you "
-    "use with their bracketed labels, for example [1]. Never invent facts, "
-    "filenames, or citations."
+    "documents. Answer using ONLY the provided context. If the context is empty or "
+    "does not contain the answer, say so plainly instead of guessing. Cite the "
+    "sources you use with their bracketed labels, for example [1]. Never invent "
+    "facts, filenames, or citations. You can also book interviews with the "
+    "book_interview tool. Call it only when the user has supplied a full name, "
+    "email address, date (YYYY-MM-DD), and time (HH:MM); never invent or guess "
+    "missing values, ask the user for them instead. Interview dates must be today "
+    "or later. After a successful booking, confirm the details."
 )
 
 REFORMULATION_PROMPT = (
@@ -57,6 +72,16 @@ class RagResult:
     answer: str
     sources: list[SourceChunk]
     standalone_query: str
+    booking: InterviewBookingRead | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Completion:
+    """Internal result of the tool-enabled completion loop."""
+
+    answer: str
+    booking: InterviewBookingRead | None = None
+    booking_attempted: bool = False
 
 
 class RagService:
@@ -68,6 +93,7 @@ class RagService:
         memory: MemoryService,
         embedder: EmbeddingService,
         qdrant: AsyncQdrantClient,
+        booking_service: BookingService | None = None,
         client: AsyncOpenAI | None = None,
         model: str | None = None,
         temperature: float | None = None,
@@ -76,6 +102,7 @@ class RagService:
         self._memory = memory
         self._embedder = embedder
         self._qdrant = qdrant
+        self._booking_service = booking_service
         self._client = client
         self._model = model or settings.llm_model
         self._temperature = settings.llm_temperature if temperature is None else temperature
@@ -99,11 +126,17 @@ class RagService:
     async def answer(self, *, session_id: str, question: str) -> RagResult:
         """Answer ``question`` with retrieved context and persist the exchange.
 
+        When a :class:`BookingService` is configured, the completion is tool
+        enabled; a validated ``book_interview`` call is persisted and returned in
+        the result. With no retrieved context and no booking attempt, the answer
+        stays deterministic instead of giving the model a chance to hallucinate.
+
         Raises:
             MemoryStoreError: Redis is unavailable.
             EmbeddingError: the embedding provider failed.
             RetrievalError: Qdrant is unavailable.
             LLMError: the chat provider failed or returned nothing usable.
+            BookingPersistenceError: a validated booking could not be stored.
         """
         history = await self._memory.get_history(session_id)
         standalone_query = (
@@ -115,20 +148,44 @@ class RagService:
             raise RetrievalError("Could not embed the search query.")
         sources = await self._search(vectors[0])
 
-        if not sources:
+        if not sources and self._booking_service is None:
             answer = NO_CONTEXT_ANSWER
+            booking: InterviewBookingRead | None = None
         else:
-            answer = await self._complete(question, history, sources)
+            completion = await self._complete(
+                session_id=session_id,
+                question=question,
+                history=history,
+                sources=sources,
+            )
+            if (
+                not sources
+                and completion.booking is None
+                and not completion.booking_attempted
+            ):
+                # No documents matched and the model did not try to book: keep the
+                # deterministic refusal even though the completion was tool-enabled.
+                answer = NO_CONTEXT_ANSWER
+                booking = None
+            else:
+                answer = completion.answer
+                booking = completion.booking
 
         await self._memory.append_exchange(session_id, question, answer)
         logger.info(
-            "Answered session %s (history=%d, sources=%d, query=%r).",
+            "Answered session %s (history=%d, sources=%d, booking=%s, query=%r).",
             session_id,
             len(history),
             len(sources),
+            booking.id if booking is not None else "none",
             standalone_query,
         )
-        return RagResult(answer=answer, sources=sources, standalone_query=standalone_query)
+        return RagResult(
+            answer=answer,
+            sources=sources,
+            standalone_query=standalone_query,
+            booking=booking,
+        )
 
     async def _reformulate(self, question: str, history: Sequence[ChatMessage]) -> str:
         """Rewrite a follow-up into a standalone query, falling back on failure."""
@@ -180,40 +237,166 @@ class RagService:
 
     async def _complete(
         self,
+        *,
+        session_id: str,
         question: str,
         history: Sequence[ChatMessage],
         sources: Sequence[SourceChunk],
-    ) -> str:
-        """Generate a grounded answer from the retrieved context."""
+    ) -> _Completion:
+        """Generate a grounded answer, executing ``book_interview`` when requested."""
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
-        for message in history:
-            if message.role == "assistant":
-                messages.append({"role": "assistant", "content": message.content})
+        for history_message in history:
+            if history_message.role == "assistant":
+                messages.append({"role": "assistant", "content": history_message.content})
             else:
-                messages.append({"role": "user", "content": message.content})
+                messages.append({"role": "user", "content": history_message.content})
+
+        context = _format_context(sources) or "(no document context matched this question)"
         messages.append(
             {
                 "role": "user",
-                "content": f"Context:\n{_format_context(sources)}\n\nQuestion: {question}",
+                "content": f"Context:\n{context}\n\nQuestion: {question}",
             }
         )
 
+        client = self._get_client()
         try:
-            response = await self._get_client().chat.completions.create(
+            if self._booking_service is None:
+                response = await client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=self._temperature,
+                )
+            else:
+                response = await client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=self._temperature,
+                    tools=[BOOK_INTERVIEW_TOOL],
+                )
+        except OpenAIError as exc:
+            logger.warning("Chat completion failed: %s", exc)
+            raise LLMError(f"LLM provider request failed: {exc}") from exc
+
+        assistant_message = response.choices[0].message
+        if not assistant_message.tool_calls or self._booking_service is None:
+            content = (assistant_message.content or "").strip()
+            if not content:
+                raise LLMError("The language model returned an empty response.")
+            return _Completion(answer=content)
+
+        messages.append(_assistant_tool_message(assistant_message))
+        booking: InterviewBookingRead | None = None
+        attempted = False
+        last_error: str | None = None
+
+        for call in assistant_message.tool_calls:
+            if call.function.name != BOOK_INTERVIEW_TOOL_NAME:
+                tool_content = f"Unknown tool '{call.function.name}'."
+            elif booking is not None:
+                tool_content = "Only one interview can be booked per turn."
+            else:
+                attempted = True
+                try:
+                    conversation_text = "\n".join(
+                        [message.content for message in history] + [question]
+                    )
+                    booking = await self._booking_service.book(
+                        session_id=session_id,
+                        arguments=call.function.arguments,
+                        conversation_text=conversation_text,
+                    )
+                    tool_content = json.dumps(
+                        {
+                            "status": "booked",
+                            "booking": booking.model_dump(mode="json"),
+                        },
+                        ensure_ascii=False,
+                    )
+                except BookingValidationError as exc:
+                    last_error = str(exc)
+                    logger.info(
+                        "Rejected booking for session %s: %s", session_id, last_error
+                    )
+                    tool_content = f"Booking rejected. {last_error}"
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": tool_content,
+                }
+            )
+
+        # Second pass: let the model turn the tool result into a natural reply.
+        try:
+            follow_up = await client.chat.completions.create(
                 model=self._model,
                 messages=messages,
                 temperature=self._temperature,
             )
         except OpenAIError as exc:
-            logger.warning("Chat completion failed: %s", exc)
+            logger.warning("Follow-up completion after tool call failed: %s", exc)
+            if booking is not None:
+                return _Completion(_booking_confirmation(booking), booking, attempted)
+            if attempted:
+                return _Completion(_booking_clarification(last_error), None, attempted)
             raise LLMError(f"LLM provider request failed: {exc}") from exc
 
-        content = (response.choices[0].message.content or "").strip()
+        content = (follow_up.choices[0].message.content or "").strip()
         if not content:
-            raise LLMError("The language model returned an empty response.")
-        return content
+            if booking is not None:
+                content = _booking_confirmation(booking)
+            elif attempted:
+                content = _booking_clarification(last_error)
+            else:
+                raise LLMError(
+                    "The language model returned an empty response after the tool call."
+                )
+        return _Completion(answer=content, booking=booking, booking_attempted=attempted)
+
+
+def _assistant_tool_message(
+    message: ChatCompletionMessage,
+) -> ChatCompletionAssistantMessageParam:
+    """Rebuild the assistant tool-call message for the follow-up request."""
+    return {
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in message.tool_calls or []
+        ],
+    }
+
+
+def _booking_confirmation(booking: InterviewBookingRead) -> str:
+    """Deterministic confirmation used when the follow-up completion fails."""
+    return (
+        f"Your interview is booked for {booking.interview_date.isoformat()} at "
+        f"{booking.interview_time.strftime('%H:%M')} for {booking.candidate_name}. "
+        f"A confirmation will be sent to {booking.candidate_email}."
+    )
+
+
+def _booking_clarification(error: str | None) -> str:
+    """Deterministic clarification used when the follow-up completion fails."""
+    prefix = "I couldn't book the interview yet."
+    if error:
+        prefix = f"{prefix} {error}"
+    return (
+        f"{prefix} Please provide your full name, email address, interview date "
+        "(YYYY-MM-DD), and time (HH:MM)."
+    )
 
 
 def _clean_query(raw: str) -> str:

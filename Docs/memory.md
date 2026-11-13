@@ -6,16 +6,17 @@
 # Project Memory & Progress Log
 
 ## Current Status
-- **Active Phase:** Phase 5 (LLM Tool Calling for Interview Booking)
+- **Active Phase:** Phase 6 (End-to-End Verification, Testing & Documentation)
 - **Completed Phases:** Phase 1 (Scaffolding & Infrastructure), Phase 2
   (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline),
-  Phase 4 (Redis Chat Memory + Custom Multi-Turn RAG Service)
-- **Blockers:** None. Phases 3 and 4 are verified end-to-end with **real local
-  inference** (Ollama `nomic-embed-text` embeddings + `llama3.2:3b` chat), so
-  ingestion and multi-turn chat run without a paid API key. Google Gemini was
-  evaluated first, but the available Google Cloud project was not eligible for
-  the free tier (HTTP 403), so the project is configured for local Ollama
-  through its OpenAI-compatible endpoint.
+  Phase 4 (Redis Chat Memory + Custom Multi-Turn RAG Service), Phase 5
+  (LLM Tool Calling + Interview Booking)
+- **Blockers:** None. Phases 3–5 are verified end-to-end with **real local
+  inference** (Ollama `nomic-embed-text` embeddings + `llama3.2:3b` chat and
+  tool calling), so ingestion, multi-turn chat, and interview booking run
+  without a paid API key. Google Gemini was evaluated first, but the available
+  Google Cloud project was not eligible for the free tier (HTTP 403), so the
+  project is configured for local Ollama through its OpenAI-compatible endpoint.
 
 ## Key Architectural Decisions
 - **Vector Store:** Qdrant (`AsyncQdrantClient`) using cosine distance and dynamic vector dimension matching the configured embedding model (default `1536` for `text-embedding-3-small`, configurable via `EMBEDDING_DIMENSION` env var so local/free models also work).
@@ -32,15 +33,16 @@
 - **ORM modelling (Phase 2):** SQLAlchemy 2.0 `DeclarativeBase` with `Mapped`/`mapped_column`. Primary keys use the portable `sqlalchemy.Uuid` type (`default=uuid.uuid4`) so SQLite and PostgreSQL share one schema. `created_at` is timezone-aware `DateTime(timezone=True)` with `server_default=func.now()`. `InterviewBooking.session_id` is indexed for per-session lookups.
 - **API schemas (Phase 2):** Pydantic v2 only, with a shared `ChunkingStrategy = Literal["fixed", "semantic"]`. `ChatRequest` trims whitespace and rejects blank inputs; `InterviewBookingToolArgs` keeps calendar date/time as strings (LLM JSON payloads) but enforces `YYYY-MM-DD` / `HH:MM` patterns plus real-calendar validation; `InterviewBookingRead` uses `from_attributes=True`; `ChatResponse` carries optional `sources` and `booking`.
 - **Chat memory (Phase 4):** each session is a Redis list at `chat:history:{session_id}` containing JSON `{"role", "content"}` entries. `MemoryService.append_exchange()` writes the user/assistant pair in one transaction and atomically applies `LTRIM -CHAT_HISTORY_MAX_MESSAGES -1` plus `EXPIRE CHAT_HISTORY_TTL_SECONDS` (defaults 20 messages / 24 h), so history is bounded and self-expiring. Malformed entries are logged and skipped. Redis failures raise `MemoryStoreError`, which the endpoint maps to 503.
-- **RAG service (Phase 4):** `RagService.answer()` loads history, rewrites follow-ups into a standalone query when history exists (small local models are unreliable at this, so a reformulation failure logs a warning and falls back to the original question), embeds that query with `EmbeddingService`, and calls Qdrant `query_points(limit=RAG_TOP_K, with_payload=True)`. Hits are mapped to `SourceChunk` with clamped cosine scores and rendered as `[n] filename=..., chunk=..., score=...` labels in the grounded prompt. Empty retrieval returns a deterministic "no relevant information" answer without calling the LLM; the exchange is still stored so the conversation stays coherent. Embedding/LLM failures map to 502, Redis/Qdrant failures to 503.
+- **RAG service (Phase 4):** `RagService.answer()` loads history, rewrites follow-ups into a standalone query when history exists (small local models are unreliable at this, so a reformulation failure logs a warning and falls back to the original question), embeds that query with `EmbeddingService`, and calls Qdrant `query_points(limit=RAG_TOP_K, with_payload=True)`. Hits are mapped to `SourceChunk` with clamped cosine scores and rendered as `[n] filename=..., chunk=..., score=...` labels in the grounded prompt. With tool calling disabled, empty retrieval returns a deterministic "no relevant information" answer without calling the LLM; with tool calling enabled (the production path), the turn runs a tool-enabled completion so a booking can still proceed, and the same deterministic refusal is returned when no booking occurs. The exchange is stored either way. Embedding/LLM failures map to 502, Redis/Qdrant failures to 503.
 - **Retrieval configuration:** `RAG_TOP_K` (default 5, max 50) lives in `Settings`; compose forwards `RAG_TOP_K`, `CHAT_HISTORY_TTL_SECONDS`, `CHAT_HISTORY_MAX_MESSAGES`, and `EMBEDDING_BATCH_SIZE` from `.env`.
+- **Interview booking (Phase 5):** `BOOK_INTERVIEW_TOOL` mirrors `InterviewBookingToolArgs` (name, email, date `YYYY-MM-DD`, time `HH:MM`). `BookingService` validates JSON with Pydantic, rejects schema/calendar errors and past dates, and requires the email to appear in the user's turns so a small model cannot invent placeholder contact details; only then is an `InterviewBooking` row committed and refreshed. `RagService` passes `tools=[BOOK_INTERVIEW_TOOL]` on the first completion, replays the assistant tool call plus a `role=tool` result, and runs a second completion without tools. Unknown tools, extra bookings in one turn, and validation failures are returned to the model for clarification. If the follow-up completion fails or is empty after a success, a deterministic confirmation is returned so the persisted booking is never hidden; failed attempts use a deterministic clarification. Database failures map to 503.
 
 ## Completed Checklist
 - [x] Phase 1: Scaffolding, Docker Compose, Core Clients (Qdrant, Redis, SQLAlchemy)
 - [x] Phase 2: ORM Models (`DocumentMetadata`, `InterviewBooking`) & Pydantic Schemas
 - [x] Phase 3: Document Ingestion API (`/api/v1/ingest`) + Fixed & Semantic Chunkers
 - [x] Phase 4: Redis Chat Memory + Custom Multi-Turn RAG Service
-- [ ] Phase 5: LLM Tool Calling (`book_interview`) + Booking Persistence
+- [x] Phase 5: LLM Tool Calling (`book_interview`) + Booking Persistence
 - [ ] Phase 6: End-to-End Verification, Pytest Suite & `README.md`
 
 ## Phase 1 — Delivered Artifacts
@@ -190,9 +192,11 @@
   `RetrievalError`. `answer()` loads history → reformulates follow-ups (when
   history exists) → embeds the standalone query → searches Qdrant with
   `limit=RAG_TOP_K` and payloads → returns a grounded answer plus attributed
-  `SourceChunk`s. `NO_CONTEXT_ANSWER` short-circuits empty retrieval, and a
-  dedicated `_clean_query()` tolerates small-model output (quotes, prefixes,
-  extra lines). Source scores are clamped to the cosine range and malformed
+  `SourceChunk`s. `NO_CONTEXT_ANSWER` short-circuits empty retrieval when tool
+  calling is not configured; Phase 5 adds a tool-enabled path that still refuses
+  deterministically if no booking results. A dedicated `_clean_query()` tolerates
+  small-model output (quotes, prefixes, extra lines). Source scores are clamped to
+  the cosine range and malformed
   payloads are skipped defensively.
 - `app/api/v1/endpoints/chat.py`: `POST /api/v1/chat` accepts `ChatRequest`,
   resolves the shared Redis/Qdrant/embedding dependencies, builds the service,
@@ -227,6 +231,50 @@
   session keys were removed afterwards (Postgres 0 rows, Qdrant 0 points, 0
   chat keys).
 
+## Phase 5 — Delivered Artifacts
+- `app/services/booking_service.py`: `BOOK_INTERVIEW_TOOL_NAME`, typed
+  `BOOK_INTERVIEW_TOOL` (name/email/date/time, all required), plus
+  `BookingValidationError`, `BookingPersistenceError`, and `BookingService` with
+  `parse_arguments()` and `book()`. Validation runs in layers: raw JSON → Pydantic
+  schema (email format, real calendar date, `HH:MM` time) → date not in the past
+  → email must appear in the user's conversation. Only then is an
+  `InterviewBooking` row committed and refreshed into `InterviewBookingRead`.
+  Pydantic errors are rendered as compact `field: message` text the model can act
+  on, and the conversation-grounding check stops small models from inventing
+  placeholder contact details.
+- `app/services/rag_service.py`: `RagResult.booking`, internal `_Completion`,
+  tool-enabled `_complete()`, assistant/tool message replay, one follow-up
+  completion, a per-turn duplicate-booking guard, deterministic
+  confirmation/clarification fallbacks, and rejection logging. Unknown tools and
+  invalid arguments are fed back to the model as tool results rather than raised.
+  Retrieval-empty non-booking turns still resolve to `NO_CONTEXT_ANSWER`.
+- `app/api/v1/endpoints/chat.py`: injects `AsyncSession`, builds
+  `BookingService(session)`, maps `BookingPersistenceError` to 503, and returns
+  `result.booking` in `ChatResponse`.
+- Postman: collection renamed to Phases 1–5 and extended with a complete booking
+  request (asserts the persisted fields) and an incomplete booking request
+  (asserts `booking == null`).
+- Verification performed: `ruff check app` clean; `mypy app` clean (24 files);
+  37 checks passed. Covered: valid/missing/malformed arguments, invalid email,
+  impossible date, bad time, past date, SQLite persistence (exactly one row,
+  candidate fields, `created_at`), invented-email rejection with zero inserts,
+  tool schema passed on the first call, tool result replayed on the second call,
+  follow-up completion not tool-enabled, booking returned and stored in Redis,
+  deterministic confirmation/clarification on follow-up failure, persistence
+  failure propagation, booking without retrieved context, and grounded RAG
+  regression.
+- Live Docker verification with real Ollama tool calling: a complete request
+  created booking `b81342c2-39da-4eca-aab5-eca65be0b19c` for Jane Doe
+  (`jane.doe@example.com`, 2026-12-01 14:30). The response carried the full
+  `booking` object, PostgreSQL held the matching row, and Redis stored the
+  two-message exchange. “I'd like to schedule an interview.” did **not** create a
+  booking: the model invented an email, the grounding check rejected it, and the
+  assistant asked for details. An explicit 2020-01-01 request was rejected by the
+  past-date rule. A leave-policy question still answered from `sample.txt`
+  (chunk 0, 0.7343) with `booking: null`. Test rows, points, and session keys were
+  removed; a pre-existing resume PDF dataset in Qdrant and its chat session were
+  identified and deliberately left untouched.
+
 ## Local Provider Setup (Ollama)
 - Host install: `ollama pull nomic-embed-text` and `ollama pull llama3.2:3b`.
 - The API container reaches the host via `host.docker.internal:11434`; this was
@@ -244,23 +292,20 @@
   for OpenAI `text-embedding-3-small`, 3072 for Gemini embeddings).
 
 ## Notes for Next Step
-- Phase 5: add `app/services/booking_service.py` with an OpenAI-compatible
-  `book_interview` tool schema requiring `name`, `email`, `date`, and `time`.
-  Reuse `InterviewBookingToolArgs` for validation so malformed or impossible
-  values are rejected before any database write.
-- Integrate the tool loop into `RagService`: pass `tools=[BOOK_INTERVIEW_TOOL]`
-  to the chat completion, inspect `tool_calls`, validate the JSON arguments
-  defensively (`llama3.2:3b` can emit malformed JSON), insert an
-  `InterviewBooking` row through an `AsyncSession`, append the `tool` role
-  message, and run a second completion for the natural-language confirmation.
-  The `RagService` and `/api/v1/chat` signature will need the DB session added;
-  `ChatResponse.booking` already exists and currently serialises as `null`.
-- Persist only validated bookings. On invalid tool arguments, ask the user for
-  the missing/corrected fields instead of raising; map database failures to 503
-  and provider failures to 502. Keep the final user/assistant text exchange in
-  Redis like Phase 4 so follow-ups remain coherent.
+- Phase 6: add the official pytest suite under `tests/`. Cover the fixed and
+  semantic chunkers, ingestion endpoint success/400/413/422/502/503 paths, Redis
+  windowing/TTL/clear, RAG retrieval and empty-context behavior, booking
+  validation (including past dates and invented emails), the tool-call loop, and
+  endpoint error mapping. Prefer deterministic fakes for Redis/Qdrant/LLM and
+  dependency overrides over live services.
+- Run an end-to-end verification with `docker compose up --build`: `/health`,
+  `/docs`, ingest a TXT and PDF, run a two-turn chat, and book an interview.
+  Keep any live-Ollama test opt-in/skipped when the model endpoint is absent.
+- Write `README.md` with an architecture diagram, setup instructions (Docker and
+  local), environment-variable table, and curl examples for ingestion, chat,
+  booking, and error cases.
 - Do not add `RetrievalQAChain`/LangChain chains, FAISS, or ChromaDB at any
   point; retrieval, prompting, and tool execution stay explicit and hand-written.
-- Phase 6 will own the pytest suite (`tests/`) and the final `README.md`; keep
-  ad-hoc verification scripts outside the repository.
+- Keep ad-hoc verification scripts outside the repository; the committed test
+  suite should be self-contained and reproducible.
 ```
