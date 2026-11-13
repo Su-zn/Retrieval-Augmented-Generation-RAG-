@@ -6,11 +6,12 @@
 # Project Memory & Progress Log
 
 ## Current Status
-- **Active Phase:** Phase 3 (Document Ingestion Pipeline)
+- **Active Phase:** Phase 4 (Redis Chat Memory + Custom RAG Service)
 - **Completed Phases:** Phase 1 (Scaffolding & Infrastructure), Phase 2
-  (Database Models & Pydantic Schemas)
-- **Blockers:** None. Docker Desktop 29.9.3 (Compose v5.7.0) is installed and
-  the full stack has been built and verified locally.
+  (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline)
+- **Blockers:** None. The Docker stack is healthy and Phase 3 was verified
+  end-to-end (HTTP → Postgres + Qdrant). Real OpenAI embeddings are still
+  unverified because no `LLM_API_KEY` is configured locally.
 
 ## Key Architectural Decisions
 - **Vector Store:** Qdrant (`AsyncQdrantClient`) using cosine distance and dynamic vector dimension matching the configured embedding model (default `1536` for `text-embedding-3-small`, configurable via `EMBEDDING_DIMENSION` env var so local/free models also work).
@@ -20,7 +21,8 @@
 - **Startup resilience:** database failures are fatal (metadata/booking writes are critical); Redis and Qdrant *transport* failures are logged as warnings so `/docs` remains reachable, with capability endpoints responsible for returning structured 503s. A Qdrant collection dimension mismatch still fails fast with an actionable `RuntimeError`.
 - **Vector collection bootstrap:** the collection is created automatically on startup with cosine distance and `EMBEDDING_DIMENSION`; existing collections are reused and their dimension validated.
 - **Session management:** `async_sessionmaker(expire_on_commit=False)`; `get_db()` yields a session, rolls back on exception, and services own commits. SQLite uses `check_same_thread=False`, plus `StaticPool` for in-memory URLs.
-- **Upload limit:** `MAX_UPLOAD_BYTES` (default 10 MiB) lives in settings for Phase 3 enforcement.
+- **Upload limit:** `MAX_UPLOAD_BYTES` (default 10 MiB) lives in settings and is enforced per request in Phase 3 (413).
+- **Ingestion pipeline (Phase 3):** extract → chunk (in a worker thread) → batched embeddings → Qdrant upsert → metadata commit. Point IDs are deterministic (`uuid5(NAMESPACE_URL, "rag://documents/{document_id}/{chunk_index}")`), so retries cannot silently duplicate chunks. Payload carries `document_id`, `chunk_index`, `text`, `filename`, and `chunking_strategy` for Phase 4 source attribution. If the DB commit fails after the upsert, the written points are deleted on a best-effort basis.
 - **Docker:** `api` waits on healthy `qdrant`, `redis`, and `postgres`; the container runs as a non-root user and exposes a `/health` liveness probe used by the compose healthcheck.
 - **ORM modelling (Phase 2):** SQLAlchemy 2.0 `DeclarativeBase` with `Mapped`/`mapped_column`. Primary keys use the portable `sqlalchemy.Uuid` type (`default=uuid.uuid4`) so SQLite and PostgreSQL share one schema. `created_at` is timezone-aware `DateTime(timezone=True)` with `server_default=func.now()`. `InterviewBooking.session_id` is indexed for per-session lookups.
 - **API schemas (Phase 2):** Pydantic v2 only, with a shared `ChunkingStrategy = Literal["fixed", "semantic"]`. `ChatRequest` trims whitespace and rejects blank inputs; `InterviewBookingToolArgs` keeps calendar date/time as strings (LLM JSON payloads) but enforces `YYYY-MM-DD` / `HH:MM` patterns plus real-calendar validation; `InterviewBookingRead` uses `from_attributes=True`; `ChatResponse` carries optional `sources` and `booking`.
@@ -28,7 +30,7 @@
 ## Completed Checklist
 - [x] Phase 1: Scaffolding, Docker Compose, Core Clients (Qdrant, Redis, SQLAlchemy)
 - [x] Phase 2: ORM Models (`DocumentMetadata`, `InterviewBooking`) & Pydantic Schemas
-- [ ] Phase 3: Document Ingestion API (`/api/v1/ingest`) + Fixed & Semantic Chunkers
+- [x] Phase 3: Document Ingestion API (`/api/v1/ingest`) + Fixed & Semantic Chunkers
 - [ ] Phase 4: Redis Chat Memory + Custom Multi-Turn RAG Service
 - [ ] Phase 5: LLM Tool Calling (`book_interview`) + Booking Persistence
 - [ ] Phase 6: End-to-End Verification, Pytest Suite & `README.md`
@@ -105,22 +107,71 @@
   `as_booking_values()` can be splatted into `InterviewBooking(...)` under
   strict mypy in Phase 5.
 
+## Phase 3 — Delivered Artifacts
+- `app/services/extractor.py`: `ExtractedDocument`, `validate_upload()` (suffix
+  + MIME allow-list, normalises `charset` parameters, accepts
+  `application/octet-stream`), `extract_document()` (UTF-8 BOM-aware TXT
+  decoding, `pypdf` parsing offloaded with `asyncio.to_thread`),
+  `collapse_internal_whitespace()`, and `ExtractionError` /
+  `UnsupportedFileTypeError` / `EmptyDocumentError`.
+- `app/services/chunker.py`: `BaseChunker` ABC, `FixedSizeChunker(500, 50)`
+  sliding window (validates size/overlap, stops at exact boundaries),
+  `SemanticRecursiveChunker(800)` (paragraph → sentence → word-boundary hard
+  split, never exceeds `max_chunk_size`), and `build_chunker()` factory.
+- `app/services/embedder.py`: `EmbeddingService` issues
+  `AsyncOpenAI.embeddings.create` in `EMBEDDING_BATCH_SIZE` (64) batches,
+  re-sorts by `index` to preserve order, and rejects vectors whose length is
+  not `EMBEDDING_DIMENSION`. The client is created lazily so a missing
+  `LLM_API_KEY` becomes a per-request `EmbeddingError` (502) instead of a
+  startup crash.
+- `app/services/ingestion_service.py`: `ingest_document()` orchestrates
+  extract → chunk → embed → upsert → commit and returns `IngestionResult`.
+  Sanitises upload names with `Path(...).name` (max 512 chars), raises
+  `VectorStoreError` / `MetadataPersistenceError`, and deletes already-upserted
+  points if the metadata commit fails.
+- `app/api/v1/endpoints/ingest.py`: `POST /api/v1/ingest` multipart upload
+  (`file` + `chunking_strategy` form field defaulting to `semantic`), streams
+  at most `MAX_UPLOAD_BYTES + 1` bytes (413 on overflow), maps extraction
+  failures to 400, embedding failures to 502, Qdrant/DB failures to 503, and
+  returns 201 with `IngestionResponse`.
+- Wiring: `app/api/v1/router.py` includes the ingest router;
+  `app/core/config.py` and `.env.example` add `EMBEDDING_BATCH_SIZE=64`.
+- Verification performed: `ruff check app` clean; `mypy app` clean (20 files);
+  47 unit checks + 19 HTTP checks (66 total) passed, covering chunker window
+  sizes/overlap/config validation, a real `reportlab` PDF, corrupt PDFs,
+  BOM/CRLF handling, non-UTF-8 TXT, batching, dimension mismatch, provider
+  failure, missing API key, `../../` filename sanitisation, Qdrant-failure
+  rollback (no metadata row), 201/400/413/422/502/503 responses, and the
+  OpenAPI multipart schema.
+- Live Docker end-to-end verification (offline OpenAI-compatible stub serving
+  1536-dimensional vectors on the compose network): TXT (`semantic`) and PDF
+  (`fixed`) uploads both returned 201; Postgres `document_metadata` and Qdrant
+  payloads agreed (2 documents / 2 points); a 4-chunk TXT produced
+  `chunk_index` 0–3 and point IDs byte-identical to the `uuid5` formula; the
+  `documents` collection reports `size=1536`, `distance=Cosine`. Error paths:
+  `.md` 400, MIME mismatch 400, empty upload 400, corrupt PDF 400, invalid
+  strategy 422, missing file 422. Test rows/points and the stub container were
+  removed; with the key unset, ingest now returns 502 and both stores are
+  empty again.
+- Real OpenAI embeddings were not exercised locally (no `LLM_API_KEY`); the
+  stub drives the identical `AsyncOpenAI` code path.
+
 ## Notes for Next Step
-- Phase 3: implement `app/services/extractor.py` (`pypdf` PDF parsing wrapped in
-  `asyncio.to_thread`, UTF-8 TXT decoding with graceful `UnicodeDecodeError`
-  handling), then `chunker.py` (`BaseChunker` ABC + `FixedSizeChunker(500, 50)`
-  + `SemanticRecursiveChunker(800)`), `embedder.py` (`AsyncOpenAI` batch
-  embeddings), and `POST /api/v1/ingest`.
-- Enforce `MAX_UPLOAD_BYTES` and `.pdf`/`.txt` extension + MIME checks in the
-  endpoint (or a thin service) and raise `HTTPException(400)` for empty files or
-  unsupported formats; translate Qdrant/OpenAI outages to 502/503.
-- Use a single `document_id` (UUID) as the Qdrant point ID namespace (for
-  example `uuid5` per chunk or Qdrant integer IDs) and store `document_id`,
-  `chunk_index`, `text`, and `filename` in the point payload so Phase 4 can
-  attribute sources.
-- Persist `DocumentMetadata` with `chunk_count=len(chunks)` and
-  `chunking_strategy` exactly as received, after vectors are upserted; keep the
-  handler thin and business logic inside services.
+- Phase 4: add Redis-backed chat memory keyed by `session_id` (append
+  user/assistant messages, trim to a bounded window, set a TTL) using the
+  shared client from `app/core/redis_client.py`.
+- Build `app/services/chat_service.py`: embed the query with
+  `EmbeddingService.embed_texts([question])`, call Qdrant `query_points`
+  (`with_payload=True`) against `QDRANT_COLLECTION`, and map hits to
+  `SourceChunk` using the Phase 3 payload (`document_id`, `filename`,
+  `chunk_index`, `text`, `score`).
+- Compose a grounded system/user prompt from retrieved chunks plus recent
+  history, then call `AsyncOpenAI.chat.completions.create` with `LLM_MODEL` and
+  `LLM_TEMPERATURE`; expose `POST /api/v1/chat` returning `ChatResponse` and
+  keep endpoints thin.
+- Handle empty retrieval explicitly, translate Redis/Qdrant/provider outages to
+  structured 503/502 errors, and make sure Redis degrades gracefully (a memory
+  outage should not take down `/docs` or ingestion).
 - Do not add `RetrievalQAChain`/LangChain chains, FAISS, or ChromaDB at any
-  point; all retrieval and completion logic stays explicit and hand-written.
+  point; retrieval and completion stay explicit and hand-written.
 ```

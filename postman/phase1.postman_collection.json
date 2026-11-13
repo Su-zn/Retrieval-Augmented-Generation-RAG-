@@ -1,13 +1,17 @@
 {
   "info": {
-    "name": "Conversational RAG Backend - Phase 1",
-    "description": "Phase 1 endpoints: liveness probe and OpenAPI schema. Ingest (/api/v1/ingest) and chat (/api/v1/chat) arrive in Phases 3-5.",
+    "name": "Conversational RAG Backend - Phases 1-3",
+    "description": "Phase 1: liveness + OpenAPI. Phase 3: POST /api/v1/ingest (multipart PDF/TXT ingestion). Chat (/api/v1/chat) arrives in Phases 4-5. The ingest requests reference sample.txt in this folder; if Postman cannot resolve it, pick the file manually in the request body.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     {
       "key": "baseUrl",
       "value": "http://localhost:8000"
+    },
+    {
+      "key": "documentId",
+      "value": ""
     }
   ],
   "item": [
@@ -56,7 +60,8 @@
             "type": "text/javascript",
             "exec": [
               "pm.test('status is 200', () => pm.response.to.have.status(200));",
-              "pm.test('schema has paths', () => pm.expect(pm.response.json().paths).to.be.an('object'));"
+              "pm.test('schema has paths', () => pm.expect(pm.response.json().paths).to.be.an('object'));",
+              "pm.test('ingest route is registered', () => pm.expect(pm.response.json().paths).to.have.property('/api/v1/ingest'));"
             ]
           }
         }
@@ -74,6 +79,128 @@
         },
         "description": "Interactive docs. Open this URL in a browser for the best experience; Postman will show raw HTML."
       }
+    },
+    {
+      "name": "Ingest TXT (semantic)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "sample.txt",
+              "description": "PDF (.pdf) or plain text (.txt). Maximum MAX_UPLOAD_BYTES (10 MiB by default)."
+            },
+            {
+              "key": "chunking_strategy",
+              "value": "semantic",
+              "type": "text",
+              "description": "fixed | semantic. Defaults to semantic."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/ingest",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "ingest"]
+        },
+        "description": "Extracts text, chunks it, embeds the chunks, upserts vectors into Qdrant, and persists metadata in SQL. Requires a valid LLM_API_KEY (or an OpenAI-compatible embeddings endpoint) in the API environment."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 201', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.test('document_id is a UUID', () => pm.expect(body.document_id).to.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i));",
+              "pm.test('filename is returned', () => pm.expect(body.filename).to.be.a('string').and.not.empty);",
+              "pm.test('strategy is echoed', () => pm.expect(body.chunking_strategy).to.eql('semantic'));",
+              "pm.test('chunks were indexed', () => pm.expect(body.chunks_indexed).to.be.above(0));",
+              "pm.collectionVariables.set('documentId', body.document_id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ingest TXT (fixed)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "sample.txt"
+            },
+            {
+              "key": "chunking_strategy",
+              "value": "fixed",
+              "type": "text"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/ingest",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "ingest"]
+        },
+        "description": "Same pipeline using 500-character windows with 50-character overlap."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 201', () => pm.response.to.have.status(201));",
+              "pm.test('fixed strategy is echoed', () => pm.expect(pm.response.json().chunking_strategy).to.eql('fixed'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ingest unsupported type (400)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "sample.md"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/ingest",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "ingest"]
+        },
+        "description": "Negative case: .md is rejected with 400 before any embedding call."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 400', () => pm.response.to.have.status(400));",
+              "pm.test('detail names supported types', () => pm.expect(pm.response.json().detail).to.include('.pdf'));"
+            ]
+          }
+        }
+      ]
     }
   ]
 }

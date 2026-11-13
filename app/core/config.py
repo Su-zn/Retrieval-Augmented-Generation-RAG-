@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     embedding_model: str = "text-embedding-3-small"
+    embedding_batch_size: int = Field(default=64, gt=0)
 
     # Uploads
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
