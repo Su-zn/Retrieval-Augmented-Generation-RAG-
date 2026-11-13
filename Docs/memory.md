@@ -6,12 +6,13 @@
 # Project Memory & Progress Log
 
 ## Current Status
-- **Active Phase:** Phase 6 (End-to-End Verification, Testing & Documentation)
+- **Status:** All six phases complete and verified.
 - **Completed Phases:** Phase 1 (Scaffolding & Infrastructure), Phase 2
   (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline),
   Phase 4 (Redis Chat Memory + Custom Multi-Turn RAG Service), Phase 5
-  (LLM Tool Calling + Interview Booking)
-- **Blockers:** None. Phases 3–5 are verified end-to-end with **real local
+  (LLM Tool Calling + Interview Booking), Phase 6 (End-to-End Verification,
+  Pytest Suite & `README.md`)
+- **Blockers:** None. Phases 3–6 are verified end-to-end with **real local
   inference** (Ollama `nomic-embed-text` embeddings + `llama3.2:3b` chat and
   tool calling), so ingestion, multi-turn chat, and interview booking run
   without a paid API key. Google Gemini was evaluated first, but the available
@@ -36,6 +37,7 @@
 - **RAG service (Phase 4):** `RagService.answer()` loads history, rewrites follow-ups into a standalone query when history exists (small local models are unreliable at this, so a reformulation failure logs a warning and falls back to the original question), embeds that query with `EmbeddingService`, and calls Qdrant `query_points(limit=RAG_TOP_K, with_payload=True)`. Hits are mapped to `SourceChunk` with clamped cosine scores and rendered as `[n] filename=..., chunk=..., score=...` labels in the grounded prompt. With tool calling disabled, empty retrieval returns a deterministic "no relevant information" answer without calling the LLM; with tool calling enabled (the production path), the turn runs a tool-enabled completion so a booking can still proceed, and the same deterministic refusal is returned when no booking occurs. The exchange is stored either way. Embedding/LLM failures map to 502, Redis/Qdrant failures to 503.
 - **Retrieval configuration:** `RAG_TOP_K` (default 5, max 50) lives in `Settings`; compose forwards `RAG_TOP_K`, `CHAT_HISTORY_TTL_SECONDS`, `CHAT_HISTORY_MAX_MESSAGES`, and `EMBEDDING_BATCH_SIZE` from `.env`.
 - **Interview booking (Phase 5):** `BOOK_INTERVIEW_TOOL` mirrors `InterviewBookingToolArgs` (name, email, date `YYYY-MM-DD`, time `HH:MM`). `BookingService` validates JSON with Pydantic, rejects schema/calendar errors and past dates, and requires the email to appear in the user's turns so a small model cannot invent placeholder contact details; only then is an `InterviewBooking` row committed and refreshed. `RagService` passes `tools=[BOOK_INTERVIEW_TOOL]` on the first completion, replays the assistant tool call plus a `role=tool` result, and runs a second completion without tools. Unknown tools, extra bookings in one turn, and validation failures are returned to the model for clarification. If the follow-up completion fails or is empty after a success, a deterministic confirmation is returned so the persisted booking is never hidden; failed attempts use a deterministic clarification. Database failures map to 503.
+- **Testing strategy (Phase 6):** endpoint services are composed through `app/api/v1/dependencies.py`, and tests override those dependencies rather than patching endpoint bodies. The suite never starts the app lifespan: `get_db`, Redis, Qdrant, and embeddings are replaced with in-memory fakes, while the LLM client is injected by monkeypatching `RagService._get_client`. This keeps all 88 tests deterministic, offline, and fast (~1 s) while still exercising the real routers, services, validation, and error mapping.
 
 ## Completed Checklist
 - [x] Phase 1: Scaffolding, Docker Compose, Core Clients (Qdrant, Redis, SQLAlchemy)
@@ -43,7 +45,7 @@
 - [x] Phase 3: Document Ingestion API (`/api/v1/ingest`) + Fixed & Semantic Chunkers
 - [x] Phase 4: Redis Chat Memory + Custom Multi-Turn RAG Service
 - [x] Phase 5: LLM Tool Calling (`book_interview`) + Booking Persistence
-- [ ] Phase 6: End-to-End Verification, Pytest Suite & `README.md`
+- [x] Phase 6: End-to-End Verification, Pytest Suite & `README.md`
 
 ## Phase 1 — Delivered Artifacts
 - `pyproject.toml` (project metadata, pinned deps, ruff/mypy/pytest config),
@@ -275,6 +277,47 @@
   removed; a pre-existing resume PDF dataset in Qdrant and its chat session were
   identified and deliberately left untouched.
 
+## Phase 6 — Delivered Artifacts
+- `app/api/v1/dependencies.py`: composable dependencies
+  (`get_memory_service`, `get_booking_service`, `get_rag_service`) so the chat
+  endpoint stays thin and tests can override infrastructure at the boundary.
+  `app/api/v1/endpoints/chat.py` now depends only on `RagService` and maps each
+  service error to its HTTP status.
+- `tests/`: 88 hermetic tests across `test_chunkers.py`, `test_schemas.py`,
+  `test_memory.py`, `test_ingestion.py`, `test_booking.py`, `test_rag.py`, and
+  `test_endpoints.py`. Shared fixtures in `tests/conftest.py` provide
+  `ApiContext` (ASGITransport client), `FakeEmbedder`, `FakeQdrant`,
+  `FakeLLMClient`, `scripted_handler`, `make_point`, `session_factory`
+  (in-memory SQLite with `StaticPool`), `fake_redis` (`fakeredis`), and
+  `install_llm` (monkeypatched `RagService._get_client`). The app lifespan is
+  intentionally not run, so no live Redis/Qdrant/Postgres connections occur.
+- `requirements-dev.txt` / `pyproject.toml`: pinned `fakeredis==2.26.2` and set
+  `asyncio_default_fixture_loop_scope = "function"` to remove the
+  pytest-asyncio deprecation warning.
+- `README.md`: architecture diagram, ingestion/chat/booking request flows,
+  project layout, Docker and local setup, full environment-variable table,
+  curl examples with real response shapes, booking validation rules, error
+  mapping, testing instructions, design notes, and known limitations.
+- Verification performed: `pytest` 88 passed; `ruff check app tests` clean;
+  `mypy app tests` clean (34 files). Coverage includes chunker boundaries,
+  schema validation, Redis window/TTL/isolation/failures, ingestion success and
+  every error path, booking validation/persistence/tool loop, RAG grounding,
+  empty retrieval, malformed Qdrant payloads, reformulation fallback, and
+  502/503 mappings.
+- Full Docker E2E with `docker compose up --build` and real Ollama:
+  `/health` returned `ok`; `/docs` returned 200; OpenAPI listed `/health`,
+  `/api/v1/ingest`, and `/api/v1/chat`. A TXT (`semantic`) and a generated PDF
+  (`fixed`) both ingested with HTTP 201. A two-turn session answered the leave
+  question from `sample.txt` (score 0.7343) and the follow-up from the PDF
+  (score 0.8843), with logs showing the follow-up rewritten to “How many days
+  per week can employees work remotely” and Redis holding 4 messages. A booking
+  for `jane.doe@example.com` on 2030-06-15 15:30 returned
+  `3c9cb860-325c-4d62-9c3e-4f1799e36648` and a matching PostgreSQL row; an
+  incomplete request created no booking and asked for the missing fields. All
+  Phase 6 test rows, points, and session keys were removed. Pre-existing user
+  data was preserved: 6 resume points, `chat:history:abc678d5-...`, and the
+  user's `swagger-booking` row/session.
+
 ## Local Provider Setup (Ollama)
 - Host install: `ollama pull nomic-embed-text` and `ollama pull llama3.2:3b`.
 - The API container reaches the host via `host.docker.internal:11434`; this was
@@ -292,20 +335,17 @@
   for OpenAI `text-embedding-3-small`, 3072 for Gemini embeddings).
 
 ## Notes for Next Step
-- Phase 6: add the official pytest suite under `tests/`. Cover the fixed and
-  semantic chunkers, ingestion endpoint success/400/413/422/502/503 paths, Redis
-  windowing/TTL/clear, RAG retrieval and empty-context behavior, booking
-  validation (including past dates and invented emails), the tool-call loop, and
-  endpoint error mapping. Prefer deterministic fakes for Redis/Qdrant/LLM and
-  dependency overrides over live services.
-- Run an end-to-end verification with `docker compose up --build`: `/health`,
-  `/docs`, ingest a TXT and PDF, run a two-turn chat, and book an interview.
-  Keep any live-Ollama test opt-in/skipped when the model endpoint is absent.
-- Write `README.md` with an architecture diagram, setup instructions (Docker and
-  local), environment-variable table, and curl examples for ingestion, chat,
-  booking, and error cases.
+- All planned phases are complete. Future work is maintenance/enhancement rather
+  than a numbered phase.
+- Possible enhancements: slot conflict detection and availability calendars,
+  authentication and per-tenant isolation, streaming chat responses, reranking
+  or hybrid (keyword + vector) retrieval, structured evaluation of answer
+  groundedness, and a CI workflow that runs `pytest`, `ruff`, and `mypy`.
+- Keep the hermetic test strategy: deterministic fakes for Redis/Qdrant/LLM and
+  dependency overrides, with any live-Ollama check opt-in and skipped when the
+  endpoint is absent.
 - Do not add `RetrievalQAChain`/LangChain chains, FAISS, or ChromaDB at any
   point; retrieval, prompting, and tool execution stay explicit and hand-written.
 - Keep ad-hoc verification scripts outside the repository; the committed test
-  suite should be self-contained and reproducible.
+  suite is self-contained and reproducible.
 ```
