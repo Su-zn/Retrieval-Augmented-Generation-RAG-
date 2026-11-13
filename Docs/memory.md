@@ -66,6 +66,10 @@
   200, Qdrant `/collections` lists `documents`, `redis-cli ping` -> PONG,
   Postgres 16.16 reachable. The stack is now verified end-to-end; no outstanding
   Docker issues.
+- Phase 1 was committed locally as `eaf3e15 "phase 1"` and pushed to
+  `origin/main` on GitHub (`Su-zn/Retrieval-Augmented-Generation-RAG-`).
+  `app/models/domain.py` and `app/models/schemas.py` were intentionally left
+  untracked (Phase 2 work not yet committed).
 - Dependency pin correction: `openai==1.59.0` does not exist on PyPI; pinned to
   `openai==1.59.2` (the docs only require the OpenAI-compatible SDK).
 
