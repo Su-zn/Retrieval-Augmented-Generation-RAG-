@@ -1,0 +1,79 @@
+{
+  "info": {
+    "name": "Conversational RAG Backend - Phase 1",
+    "description": "Phase 1 endpoints: liveness probe and OpenAPI schema. Ingest (/api/v1/ingest) and chat (/api/v1/chat) arrive in Phases 3-5.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        },
+        "description": "Liveness probe. Expects 200 and status=ok."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "pm.test('body reports ok', () => pm.expect(pm.response.json().status).to.eql('ok'));",
+              "pm.test('has version', () => pm.expect(pm.response.json().version).to.be.a('string'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "OpenAPI schema",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/openapi.json",
+          "host": ["{{baseUrl}}"],
+          "path": ["openapi.json"]
+        },
+        "description": "Machine-readable OpenAPI schema. Useful to confirm registered routes."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "pm.test('schema has paths', () => pm.expect(pm.response.json().paths).to.be.an('object'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Swagger UI (HTML)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/docs",
+          "host": ["{{baseUrl}}"],
+          "path": ["docs"]
+        },
+        "description": "Interactive docs. Open this URL in a browser for the best experience; Postman will show raw HTML."
+      }
+    }
+  ]
+}

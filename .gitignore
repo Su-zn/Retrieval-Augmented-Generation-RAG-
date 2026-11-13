@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data / secrets
+.env
+app.db
+*.sqlite3
+qdrant_storage/
+redis_data/
+pg_data/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
