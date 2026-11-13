@@ -90,6 +90,20 @@
   and negative cases for email, impossible dates (`2026-02-30`), invalid times
   (`25:00`), blank names, and blank chat fields; TestClient lifespan startup
   still returns HTTP 200 from `/health` with the new models registered.
+- Extended verification (25 checks, all passed): table registration, SQLite
+  persistence round-trips, UUID defaults, `created_at` population, query by
+  `session_id`, `InterviewBookingRead.model_validate` from ORM attributes,
+  JSON date/time/email serialisation, `as_booking_values()` parsing, and
+  negative cases for bad email/date/time/name plus blank chat inputs.
+  In-memory SQLite (`StaticPool`) startup was verified separately.
+- PostgreSQL verification (Docker): rebuilt the API image and restarted the
+  stack; startup created both tables in Postgres with `uuid` primary keys,
+  `varchar` columns, `date`/`time` fields, timezone-aware `created_at`
+  defaulting to `now()`, and `ix_interview_bookings_session_id`. The API
+  reported healthy and `/health` returned 200.
+- `schemas.py` exposes `BookingValues` (`TypedDict`) so
+  `as_booking_values()` can be splatted into `InterviewBooking(...)` under
+  strict mypy in Phase 5.
 
 ## Notes for Next Step
 - Phase 3: implement `app/services/extractor.py` (`pypdf` PDF parsing wrapped in
