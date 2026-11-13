@@ -7,7 +7,8 @@ Endpoint routers are attached here as their phases land:
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import ingest
+from app.api.v1.endpoints import chat, ingest
 
 api_router: APIRouter = APIRouter()
 api_router.include_router(ingest.router)
+api_router.include_router(chat.router)

@@ -6,14 +6,15 @@
 # Project Memory & Progress Log
 
 ## Current Status
-- **Active Phase:** Phase 4 (Redis Chat Memory + Custom RAG Service)
+- **Active Phase:** Phase 5 (LLM Tool Calling for Interview Booking)
 - **Completed Phases:** Phase 1 (Scaffolding & Infrastructure), Phase 2
-  (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline)
-- **Blockers:** None. The stack is healthy and Phase 3 was verified end-to-end
-  with **real local embeddings** (Ollama `nomic-embed-text`, 768 dims), so the
-  full HTTP → Postgres + Qdrant path runs without a paid API key. Google Gemini
-  was evaluated first, but the available Google Cloud project was not eligible
-  for the free tier (HTTP 403), so the project is configured for local Ollama
+  (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline),
+  Phase 4 (Redis Chat Memory + Custom Multi-Turn RAG Service)
+- **Blockers:** None. Phases 3 and 4 are verified end-to-end with **real local
+  inference** (Ollama `nomic-embed-text` embeddings + `llama3.2:3b` chat), so
+  ingestion and multi-turn chat run without a paid API key. Google Gemini was
+  evaluated first, but the available Google Cloud project was not eligible for
+  the free tier (HTTP 403), so the project is configured for local Ollama
   through its OpenAI-compatible endpoint.
 
 ## Key Architectural Decisions
@@ -30,12 +31,15 @@
 - **Docker:** `api` waits on healthy `qdrant`, `redis`, and `postgres`; the container runs as a non-root user and exposes a `/health` liveness probe used by the compose healthcheck.
 - **ORM modelling (Phase 2):** SQLAlchemy 2.0 `DeclarativeBase` with `Mapped`/`mapped_column`. Primary keys use the portable `sqlalchemy.Uuid` type (`default=uuid.uuid4`) so SQLite and PostgreSQL share one schema. `created_at` is timezone-aware `DateTime(timezone=True)` with `server_default=func.now()`. `InterviewBooking.session_id` is indexed for per-session lookups.
 - **API schemas (Phase 2):** Pydantic v2 only, with a shared `ChunkingStrategy = Literal["fixed", "semantic"]`. `ChatRequest` trims whitespace and rejects blank inputs; `InterviewBookingToolArgs` keeps calendar date/time as strings (LLM JSON payloads) but enforces `YYYY-MM-DD` / `HH:MM` patterns plus real-calendar validation; `InterviewBookingRead` uses `from_attributes=True`; `ChatResponse` carries optional `sources` and `booking`.
+- **Chat memory (Phase 4):** each session is a Redis list at `chat:history:{session_id}` containing JSON `{"role", "content"}` entries. `MemoryService.append_exchange()` writes the user/assistant pair in one transaction and atomically applies `LTRIM -CHAT_HISTORY_MAX_MESSAGES -1` plus `EXPIRE CHAT_HISTORY_TTL_SECONDS` (defaults 20 messages / 24 h), so history is bounded and self-expiring. Malformed entries are logged and skipped. Redis failures raise `MemoryStoreError`, which the endpoint maps to 503.
+- **RAG service (Phase 4):** `RagService.answer()` loads history, rewrites follow-ups into a standalone query when history exists (small local models are unreliable at this, so a reformulation failure logs a warning and falls back to the original question), embeds that query with `EmbeddingService`, and calls Qdrant `query_points(limit=RAG_TOP_K, with_payload=True)`. Hits are mapped to `SourceChunk` with clamped cosine scores and rendered as `[n] filename=..., chunk=..., score=...` labels in the grounded prompt. Empty retrieval returns a deterministic "no relevant information" answer without calling the LLM; the exchange is still stored so the conversation stays coherent. Embedding/LLM failures map to 502, Redis/Qdrant failures to 503.
+- **Retrieval configuration:** `RAG_TOP_K` (default 5, max 50) lives in `Settings`; compose forwards `RAG_TOP_K`, `CHAT_HISTORY_TTL_SECONDS`, `CHAT_HISTORY_MAX_MESSAGES`, and `EMBEDDING_BATCH_SIZE` from `.env`.
 
 ## Completed Checklist
 - [x] Phase 1: Scaffolding, Docker Compose, Core Clients (Qdrant, Redis, SQLAlchemy)
 - [x] Phase 2: ORM Models (`DocumentMetadata`, `InterviewBooking`) & Pydantic Schemas
 - [x] Phase 3: Document Ingestion API (`/api/v1/ingest`) + Fixed & Semantic Chunkers
-- [ ] Phase 4: Redis Chat Memory + Custom Multi-Turn RAG Service
+- [x] Phase 4: Redis Chat Memory + Custom Multi-Turn RAG Service
 - [ ] Phase 5: LLM Tool Calling (`book_interview`) + Booking Persistence
 - [ ] Phase 6: End-to-End Verification, Pytest Suite & `README.md`
 
@@ -174,6 +178,55 @@
   needs billing or a new eligible project. No application code changes were
   needed for either provider.
 
+## Phase 4 — Delivered Artifacts
+- `app/services/memory_service.py`: `ChatRole`, frozen `ChatMessage`,
+  `history_key()` (`chat:history:{session_id}`), and `MemoryService` with
+  `get_history()`, `append_exchange()`, and `clear()`. Each append uses a
+  transactional pipeline (`RPUSH` pair → `LTRIM` window → `EXPIRE` TTL), so the
+  history is atomically bounded and refreshed. Corrupt JSON and invalid
+  role/content pairs are skipped with a warning instead of failing the turn.
+  Every Redis failure becomes `MemoryStoreError`.
+- `app/services/rag_service.py`: `RagService`, `RagResult`, `LLMError`, and
+  `RetrievalError`. `answer()` loads history → reformulates follow-ups (when
+  history exists) → embeds the standalone query → searches Qdrant with
+  `limit=RAG_TOP_K` and payloads → returns a grounded answer plus attributed
+  `SourceChunk`s. `NO_CONTEXT_ANSWER` short-circuits empty retrieval, and a
+  dedicated `_clean_query()` tolerates small-model output (quotes, prefixes,
+  extra lines). Source scores are clamped to the cosine range and malformed
+  payloads are skipped defensively.
+- `app/api/v1/endpoints/chat.py`: `POST /api/v1/chat` accepts `ChatRequest`,
+  resolves the shared Redis/Qdrant/embedding dependencies, builds the service,
+  and maps `MemoryStoreError`/`RetrievalError` → 503 and
+  `EmbeddingError`/`LLMError` → 502. Registered in `app/api/v1/router.py`;
+  OpenAPI now lists `/api/v1/ingest`, `/api/v1/chat`, and `/health`.
+- Wiring: `RAG_TOP_K` added to `Settings` and `.env.example`; compose now
+  forwards `RAG_TOP_K`, `CHAT_HISTORY_TTL_SECONDS`,
+  `CHAT_HISTORY_MAX_MESSAGES`, and `EMBEDDING_BATCH_SIZE`. The Postman
+  collection is renamed to Phases 1–4 and adds chat turn 1, a same-session
+  follow-up, and a blank-message 422 case.
+- Verification performed: `ruff check app` clean; `mypy app` clean (23 files);
+  36 checks passed (18 memory/helper + 18 stubbed service branches). Covered:
+  key format, chronological order, window trimming (both logical and physical
+  Redis list), TTL bounds, malformed-entry skipping, clear/delete, query
+  cleaning, context labels, score clamping, invalid payloads, empty retrieval
+  (no LLM call, exchange still stored), `top_k`, two-call reformulation flow,
+  prompt contents, source mapping, Qdrant failure → `RetrievalError`, empty
+  completion → `LLMError`, and reformulation failure fallback.
+- Live Docker verification with real Ollama inference: rebuilt the API
+  (`RAG_TOP_K=5`, max messages 20, TTL 86400), ingested `sample.txt` (HTTP 201),
+  and ran two turns in one session. Turn 1 answered “25 days … two weeks in
+  advance” with `sample.txt` chunk 0 (score 0.7406). Turn 2 answered “three days
+  per week” (score 0.6525) and the logs show the follow-up was rewritten to
+  “How many days per week are allowed for remote work” before retrieval. Redis
+  `chat:history:phase4-live` held exactly 4 messages with TTL 86400. An
+  out-of-domain question produced an explicit refusal based on the handbook
+  rather than a hallucinated answer. A whitespace-only message returned 422.
+  Stopping Redis made chat return
+  `503 {"detail":"Chat memory is temporarily unavailable."}`; after restarting
+  Redis, chat recovered and history was written. All test documents, points, and
+  session keys were removed afterwards (Postgres 0 rows, Qdrant 0 points, 0
+  chat keys).
+
 ## Local Provider Setup (Ollama)
 - Host install: `ollama pull nomic-embed-text` and `ollama pull llama3.2:3b`.
 - The API container reaches the host via `host.docker.internal:11434`; this was
@@ -191,24 +244,23 @@
   for OpenAI `text-embedding-3-small`, 3072 for Gemini embeddings).
 
 ## Notes for Next Step
-- Phase 4: add Redis-backed chat memory keyed by `session_id` (append
-  user/assistant messages, trim to a bounded window, set a TTL) using the
-  shared client from `app/core/redis_client.py`.
-- Build `app/services/chat_service.py`: embed the query with
-  `EmbeddingService.embed_texts([question])`, call Qdrant `query_points`
-  (`with_payload=True`) against `QDRANT_COLLECTION`, and map hits to
-  `SourceChunk` using the Phase 3 payload (`document_id`, `filename`,
-  `chunk_index`, `text`, `score`).
-- Compose a grounded system/user prompt from retrieved chunks plus recent
-  history, then call `AsyncOpenAI.chat.completions.create` with `LLM_MODEL` and
-  `LLM_TEMPERATURE`; expose `POST /api/v1/chat` returning `ChatResponse` and
-  keep endpoints thin.
-- Handle empty retrieval explicitly, translate Redis/Qdrant/provider outages to
-  structured 503/502 errors, and make sure Redis degrades gracefully (a memory
-  outage should not take down `/docs` or ingestion).
-- Ollama note for Phase 4/5: `nomic-embed-text` is the query/document embedding
-  model, and `llama3.2:3b` handles chat plus basic tool calling. Validate tool
-  arguments defensively in Phase 5, because small-model JSON can be malformed.
+- Phase 5: add `app/services/booking_service.py` with an OpenAI-compatible
+  `book_interview` tool schema requiring `name`, `email`, `date`, and `time`.
+  Reuse `InterviewBookingToolArgs` for validation so malformed or impossible
+  values are rejected before any database write.
+- Integrate the tool loop into `RagService`: pass `tools=[BOOK_INTERVIEW_TOOL]`
+  to the chat completion, inspect `tool_calls`, validate the JSON arguments
+  defensively (`llama3.2:3b` can emit malformed JSON), insert an
+  `InterviewBooking` row through an `AsyncSession`, append the `tool` role
+  message, and run a second completion for the natural-language confirmation.
+  The `RagService` and `/api/v1/chat` signature will need the DB session added;
+  `ChatResponse.booking` already exists and currently serialises as `null`.
+- Persist only validated bookings. On invalid tool arguments, ask the user for
+  the missing/corrected fields instead of raising; map database failures to 503
+  and provider failures to 502. Keep the final user/assistant text exchange in
+  Redis like Phase 4 so follow-ups remain coherent.
 - Do not add `RetrievalQAChain`/LangChain chains, FAISS, or ChromaDB at any
-  point; retrieval and completion stay explicit and hand-written.
+  point; retrieval, prompting, and tool execution stay explicit and hand-written.
+- Phase 6 will own the pytest suite (`tests/`) and the final `README.md`; keep
+  ad-hoc verification scripts outside the repository.
 ```

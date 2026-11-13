@@ -1,7 +1,7 @@
 {
   "info": {
-    "name": "Conversational RAG Backend - Phases 1-3",
-    "description": "Phase 1: liveness + OpenAPI. Phase 3: POST /api/v1/ingest (multipart PDF/TXT ingestion). Chat (/api/v1/chat) arrives in Phases 4-5. The ingest requests reference sample.txt in this folder; if Postman cannot resolve it, pick the file manually in the request body.",
+    "name": "Conversational RAG Backend - Phases 1-4",
+    "description": "Phase 1: liveness + OpenAPI. Phase 3: POST /api/v1/ingest (multipart PDF/TXT ingestion). Phase 4: POST /api/v1/chat (Redis memory + Qdrant retrieval + grounded answers). Ingest sample.txt first, then run the two chat requests in order to exercise multi-turn memory. The ingest requests reference sample.txt in this folder; if Postman cannot resolve it, pick the file manually in the request body.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -12,6 +12,10 @@
     {
       "key": "documentId",
       "value": ""
+    },
+    {
+      "key": "sessionId",
+      "value": "postman-demo-session"
     }
   ],
   "item": [
@@ -61,7 +65,8 @@
             "exec": [
               "pm.test('status is 200', () => pm.response.to.have.status(200));",
               "pm.test('schema has paths', () => pm.expect(pm.response.json().paths).to.be.an('object'));",
-              "pm.test('ingest route is registered', () => pm.expect(pm.response.json().paths).to.have.property('/api/v1/ingest'));"
+              "pm.test('ingest route is registered', () => pm.expect(pm.response.json().paths).to.have.property('/api/v1/ingest'));",
+              "pm.test('chat route is registered', () => pm.expect(pm.response.json().paths).to.have.property('/api/v1/chat'));"
             ]
           }
         }
@@ -197,6 +202,134 @@
             "exec": [
               "pm.test('status is 400', () => pm.response.to.have.status(400));",
               "pm.test('detail names supported types', () => pm.expect(pm.response.json().detail).to.include('.pdf'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat turn 1 (leave policy)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{sessionId}}\",\n  \"message\": \"How many days of paid annual leave do employees get?\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "chat"]
+        },
+        "description": "First turn: retrieves the top RAG_TOP_K chunks, answers with source attribution, and stores the exchange in Redis under chat:history:{session_id}."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('session is echoed', () => pm.expect(body.session_id).to.eql(pm.collectionVariables.get('sessionId')));",
+              "pm.test('answer is not empty', () => pm.expect(body.answer).to.be.a('string').and.not.empty);",
+              "pm.test('sources are returned', () => pm.expect(body.sources).to.be.an('array').with.length.above(0));",
+              "pm.test('source includes attribution', () => pm.expect(body.sources[0]).to.include.keys('document_id', 'filename', 'chunk_index', 'text', 'score'));",
+              "pm.test('booking is null before Phase 5', () => pm.expect(body.booking).to.eql(null));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat turn 2 (follow-up, tests memory)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{sessionId}}\",\n  \"message\": \"And what about remote work - how many days per week are allowed?\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "chat"]
+        },
+        "description": "Second turn with the same session_id. History exists, so the query is first rewritten into a standalone search query before retrieval."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 200', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('same session', () => pm.expect(body.session_id).to.eql(pm.collectionVariables.get('sessionId')));",
+              "pm.test('answer is not empty', () => pm.expect(body.answer).to.be.a('string').and.not.empty);",
+              "pm.test('sources are returned', () => pm.expect(body.sources).to.be.an('array').with.length.above(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat blank message (422)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{sessionId}}\",\n  \"message\": \"   \"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/chat",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "chat"]
+        },
+        "description": "Negative case: whitespace-only messages are rejected by the stripped-field validator with 422."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status is 422', () => pm.response.to.have.status(422));",
+              "pm.test('message field is flagged', () => pm.expect(pm.response.json().detail[0].loc).to.include('message'));"
             ]
           }
         }

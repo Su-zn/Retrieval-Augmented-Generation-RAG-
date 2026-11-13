@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_batch_size: int = Field(default=64, gt=0)
 
+    # Retrieval
+    rag_top_k: int = Field(default=5, gt=0, le=50)
+
     # Uploads
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
 
