@@ -9,14 +9,18 @@
 - **Active Phase:** Phase 4 (Redis Chat Memory + Custom RAG Service)
 - **Completed Phases:** Phase 1 (Scaffolding & Infrastructure), Phase 2
   (Database Models & Pydantic Schemas), Phase 3 (Document Ingestion Pipeline)
-- **Blockers:** None. The Docker stack is healthy and Phase 3 was verified
-  end-to-end (HTTP → Postgres + Qdrant). Real OpenAI embeddings are still
-  unverified because no `LLM_API_KEY` is configured locally.
+- **Blockers:** None. The stack is healthy and Phase 3 was verified end-to-end
+  with **real local embeddings** (Ollama `nomic-embed-text`, 768 dims), so the
+  full HTTP → Postgres + Qdrant path runs without a paid API key. Google Gemini
+  was evaluated first, but the available Google Cloud project was not eligible
+  for the free tier (HTTP 403), so the project is configured for local Ollama
+  through its OpenAI-compatible endpoint.
 
 ## Key Architectural Decisions
 - **Vector Store:** Qdrant (`AsyncQdrantClient`) using cosine distance and dynamic vector dimension matching the configured embedding model (default `1536` for `text-embedding-3-small`, configurable via `EMBEDDING_DIMENSION` env var so local/free models also work).
 - **Relational DB:** SQLAlchemy 2.0 async configured via `DATABASE_URL` (defaults to `sqlite+aiosqlite:///./app.db` for instant local run, and `postgresql+asyncpg://...` inside `docker-compose.yml`).
-- **LLM Client:** OpenAI-compatible `AsyncOpenAI` client reading `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, and `EMBEDDING_MODEL` from `.env` so any provider (OpenAI, OpenRouter, Groq) works without code changes.
+- **LLM Client:** OpenAI-compatible `AsyncOpenAI` client reading `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSION` from `.env`, so OpenAI, Gemini, Mistral, Ollama, or any OpenAI-compatible provider works without code changes.
+- **Local provider (Ollama):** `.env` points to `http://host.docker.internal:11434/v1` with `LLM_MODEL=llama3.2:3b`, `EMBEDDING_MODEL=nomic-embed-text`, `EMBEDDING_DIMENSION=768`, and a dummy `LLM_API_KEY=ollama`. `host.docker.internal` is required because the API runs inside Docker while Ollama runs on the Windows host; the endpoint was verified reachable from inside the container.
 - **Configuration:** one cached `Settings` object (`app/core/config.py`, `pydantic-settings`) shared process-wide; `ENVIRONMENT` accepts `local | development | docker | staging | production | test`. Blank optional env values (`QDRANT_API_KEY`, `LLM_BASE_URL`) are normalised to `None`.
 - **Startup resilience:** database failures are fatal (metadata/booking writes are critical); Redis and Qdrant *transport* failures are logged as warnings so `/docs` remains reachable, with capability endpoints responsible for returning structured 503s. A Qdrant collection dimension mismatch still fails fast with an actionable `RuntimeError`.
 - **Vector collection bootstrap:** the collection is created automatically on startup with cosine distance and `EMBEDDING_DIMENSION`; existing collections are reused and their dimension validated.
@@ -151,10 +155,40 @@
   `documents` collection reports `size=1536`, `distance=Cosine`. Error paths:
   `.md` 400, MIME mismatch 400, empty upload 400, corrupt PDF 400, invalid
   strategy 422, missing file 422. Test rows/points and the stub container were
-  removed; with the key unset, ingest now returns 502 and both stores are
-  empty again.
-- Real OpenAI embeddings were not exercised locally (no `LLM_API_KEY`); the
-  stub drives the identical `AsyncOpenAI` code path.
+  removed (later superseded by the real Ollama run below).
+- Local provider verification (Ollama, real inference): `nomic-embed-text`
+  returns 768-dimensional vectors and accepts batched `input` lists;
+  `llama3.2:3b` answers chat completions through the same OpenAI-compatible
+  endpoint. Rebuilt the stack with
+  `LLM_BASE_URL=http://host.docker.internal:11434/v1`, recreated the Qdrant
+  collection at 768 dimensions, and ingested `sample.txt` (`semantic`, 1 chunk)
+  and a 10-section TXT (`fixed`, 3 chunks) — both HTTP 201, Postgres rows and
+  Qdrant payloads consistent (4 points), and a query embedding for “How many
+  days of annual leave…?” ranked the leave-policy chunk first (score 0.7436).
+  Test documents were removed afterwards; Postgres and Qdrant are back to zero.
+- Google Gemini was also attempted: the `AQ.`-prefixed AI Studio key
+  authenticated (`models.list` succeeded), but inference returned
+  `403 PERMISSION_DENIED: The Gemini API free tier is not available for this
+  project`. Per Google's troubleshooting docs this is project-level
+  eligibility; a new key in the same project does not help, and the project
+  needs billing or a new eligible project. No application code changes were
+  needed for either provider.
+
+## Local Provider Setup (Ollama)
+- Host install: `ollama pull nomic-embed-text` and `ollama pull llama3.2:3b`.
+- The API container reaches the host via `host.docker.internal:11434`; this was
+  verified with a container-side probe (model list, 2×768 embedding batch, chat
+  reply), not just from the host.
+- `.env` (gitignored) currently uses:
+  `LLM_API_KEY=ollama`,
+  `LLM_BASE_URL=http://host.docker.internal:11434/v1`,
+  `LLM_MODEL=llama3.2:3b`,
+  `EMBEDDING_MODEL=nomic-embed-text`,
+  `EMBEDDING_DIMENSION=768`,
+  `EMBEDDING_BATCH_SIZE=16`.
+- When switching embedding providers, delete the `documents` collection before
+  restarting so startup recreates it at the new dimension (768 for Ollama, 1536
+  for OpenAI `text-embedding-3-small`, 3072 for Gemini embeddings).
 
 ## Notes for Next Step
 - Phase 4: add Redis-backed chat memory keyed by `session_id` (append
@@ -172,6 +206,9 @@
 - Handle empty retrieval explicitly, translate Redis/Qdrant/provider outages to
   structured 503/502 errors, and make sure Redis degrades gracefully (a memory
   outage should not take down `/docs` or ingestion).
+- Ollama note for Phase 4/5: `nomic-embed-text` is the query/document embedding
+  model, and `llama3.2:3b` handles chat plus basic tool calling. Validate tool
+  arguments defensively in Phase 5, because small-model JSON can be malformed.
 - Do not add `RetrievalQAChain`/LangChain chains, FAISS, or ChromaDB at any
   point; retrieval and completion stay explicit and hand-written.
 ```
