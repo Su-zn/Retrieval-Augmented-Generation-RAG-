@@ -132,8 +132,6 @@ A production-style FastAPI backend for **document ingestion**, **multi-turn retr
 │       ├── rag_service.py       # Retrieval, prompting, tool loop
 │       └── booking_service.py   # Booking validation + persistence
 ├── tests/                       # Hermetic pytest suite
-├── postman/phase1.postman_collection.json
-├── Docs/                        # Product, design, architecture, phase notes
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
@@ -265,7 +263,7 @@ All settings are read from environment variables (and `.env`), case-insensitivel
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
-  -F "file=@./postman/sample.txt;type=text/plain" \
+  -F "file=@./handbook.txt;type=text/plain" \
   -F "chunking_strategy=semantic"
 ```
 
@@ -393,10 +391,6 @@ curl -X POST http://localhost:8000/api/v1/chat \
 ```
 
 If the follow-up completion fails after a successful insert, the API returns a deterministic confirmation so the persisted booking is never hidden. If it fails after a rejected attempt, it returns a deterministic clarification.
-
-### Postman
-
-Import [`postman/phase1.postman_collection.json`](postman/phase1.postman_collection.json). It contains requests and assertions for health, ingestion (TXT/PDF), multi-turn chat, validation errors, a successful booking, and an incomplete booking.
 
 ---
 

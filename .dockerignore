@@ -11,5 +11,4 @@ __pycache__/
 app.db
 *.sqlite3
 tests/
-docs/
 README.md
